@@ -12,11 +12,13 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 use nix::libc;
-use nix::mount::{MsFlags, mount};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, Pid, chdir, chroot, execvp, fork, pipe, read, sethostname, write};
+use nix::unistd::{
+    ForkResult, Pid, chdir, execvp, fork, pipe, pivot_root, read, sethostname, write,
+};
 
 const ROOTFS: &str = "/home/andreastrolle.guest/rootfs";
 
@@ -188,8 +190,7 @@ fn run_container(
             std::fs::write(format!("/sys/fs/cgroup/rcr/{name}/cgroup.procs"), "0")
                 .expect("self-join cgroup failed");
 
-            chroot(ROOTFS).expect("chroot failed");
-            chdir("/").expect("chdir failed");
+            pivot_root_util();
 
             mount(
                 Some("proc"),
@@ -214,6 +215,28 @@ fn run_container(
             waitpid(child, None).expect("waitpid failed");
         }
     }
+}
+
+fn pivot_root_util() {
+    // pivot_root doesn't change a dir, it swaps mounts (/ <-> ROOTFS)
+    mount(
+        Some(ROOTFS),
+        ROOTFS,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .expect("bind mount rootfs failed");
+
+    let put_old = format!("{ROOTFS}/.old_root");
+    fs::create_dir_all(&put_old).expect("create .old_root failed");
+
+    pivot_root(ROOTFS, put_old.as_str()).expect("pivot_root failed");
+
+    chdir("/").expect("chdir failed");
+
+    umount2("/.old_root", MntFlags::MNT_DETACH).expect("unmount old root failed");
+    fs::remove_dir("/.old_root").ok();
 }
 
 fn get_vhost_vchild(name: &str) -> (String, String) {
