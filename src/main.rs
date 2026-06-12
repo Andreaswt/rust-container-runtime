@@ -5,15 +5,16 @@ mod image;
 mod state;
 mod utils;
 
+use std::path::Path;
+
 use crate::container::run_container;
 use crate::host::{list_containers, logs, orchestrator, stop_container};
-use crate::image::Image;
+use crate::image::{Image, pull_image};
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
 
-const ROOTFS: &str = "/home/andreastrolle.guest/rootfs";
-
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run {
@@ -24,11 +25,18 @@ fn main() {
         } => {
             let lower = match image {
                 Some(img) => std::fs::read_to_string(format!("/var/lib/rcr/images/{img}"))
-                    .expect("image not found"),
-                None => ROOTFS.to_string(),
+                    .with_context(|| format!("image {img} not found"))?,
+                None => {
+                    // Default to alpine
+                    let base = "/var/lib/rcr/bases/alpine";
+                    if !Path::new(base).exists() {
+                        pull_image("alpine")?;
+                    }
+                    base.to_string()
+                }
             };
 
-            orchestrator(&name, &lower, detach, true, command)
+            orchestrator(&name, &lower, detach, true, command)?;
         }
         Commands::Build { name } => {
             Image::base("alpine")
@@ -38,9 +46,7 @@ fn main() {
                     "/Users/andreastrolle/Documents/Repositories/rust-container-runtime/main.py",
                     "/main.py",
                 )
-                .run("printenv secret")
-                .run("python /main.py")
-                .build(&name);
+                .build(&name)?;
         }
         Commands::List => list_containers(),
         Commands::Stop { name } => stop_container(&name),
@@ -59,6 +65,7 @@ fn main() {
             netns_ready_fd,
             net_configured_fd,
             command,
-        ),
+        )?,
     }
+    Ok(())
 }

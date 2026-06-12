@@ -1,13 +1,18 @@
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 
 use crate::state::remove;
 
-pub fn execute_command(cmd: &str, args: &[&str]) {
-    let status = Command::new(cmd).args(args).status();
-    if !status.unwrap().success() {
-        panic!("{cmd} failed with {args:?}");
+pub fn execute_command(cmd: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to spawn {cmd}"))?;
+    if !status.success() {
+        bail!("{cmd} failed with {args:?}");
     }
+    Ok(())
 }
 
 pub fn get_vhost_vchild(name: &str) -> (String, String) {

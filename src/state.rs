@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -16,10 +17,11 @@ fn state_path(name: &str) -> PathBuf {
     PathBuf::from(STATE_DIR).join(format!("{name}.json"))
 }
 
-pub fn save(state: &ContainerState) {
-    fs::create_dir_all(STATE_DIR).expect("create state dir failed");
-    let json = serde_json::to_string_pretty(state).expect("serialize state failed");
-    fs::write(state_path(&state.name), json).expect("write state failed");
+pub fn save(state: &ContainerState) -> Result<()> {
+    fs::create_dir_all(STATE_DIR).context("create state dir failed")?;
+    let json = serde_json::to_string_pretty(state).context("serialize state failed")?;
+    fs::write(state_path(&state.name), json).context("write state failed")?;
+    Ok(())
 }
 
 pub fn load(name: &str) -> Option<ContainerState> {

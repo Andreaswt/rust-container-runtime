@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use std::env::set_var;
 use std::fs::{self, read_to_string};
 
@@ -20,24 +21,23 @@ pub fn run_container(
     netns_ready_w: i32,
     net_configured_r: i32,
     command: Vec<String>,
-) {
+) -> Result<()> {
     unshare(
         CloneFlags::CLONE_NEWPID
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWUTS
             | CloneFlags::CLONE_NEWNET,
     )
-    .expect("unshare failed");
+    .context("unshare failed")?;
 
     let netns_ready_w = unsafe { OwnedFd::from_raw_fd(netns_ready_w) };
-    write(&netns_ready_w, &[1u8]).expect("signal netns_ready failed");
+    write(&netns_ready_w, &[1u8]).context("signal netns_ready failed")?;
 
-    match unsafe { fork() }.expect("fork failed") {
-        #[allow(unreachable_code)]
+    match unsafe { fork() }.context("fork failed")? {
         ForkResult::Child => {
             let net_configured_r = unsafe { OwnedFd::from_raw_fd(net_configured_r) };
             let mut buf = [0u8; 1];
-            read(&net_configured_r, &mut buf).expect("wait net_configured failed");
+            read(&net_configured_r, &mut buf).context("wait net_configured failed")?;
 
             mount(
                 None::<&str>,
@@ -46,19 +46,19 @@ pub fn run_container(
                 MsFlags::MS_REC | MsFlags::MS_PRIVATE,
                 None::<&str>,
             )
-            .expect("make / private mounts failed");
+            .context("make / private mounts failed")?;
 
-            setup_container_networking(&name, &child_ip);
+            setup_container_networking(&name, &child_ip)?;
 
-            sethostname(&name).expect("sethostname failed");
+            sethostname(&name).context("sethostname failed")?;
 
             // Join cgroup, then chroot removes privileges to unjoin
             std::fs::write(format!("/sys/fs/cgroup/rcr/{name}/cgroup.procs"), "0")
-                .expect("self-join cgroup failed");
+                .context("self-join cgroup failed")?;
 
-            let merged = setup_overlay(name, lower);
+            let merged = setup_overlay(name, lower)?;
             setup_dns(&merged);
-            pivot_root_util(&merged);
+            pivot_root_util(&merged)?;
 
             mount(
                 Some("proc"),
@@ -67,10 +67,10 @@ pub fn run_container(
                 MsFlags::empty(),
                 None::<&str>,
             )
-            .expect("proc mount failed");
+            .context("proc mount failed")?;
 
             drop_capabilities();
-            apply_seccomp();
+            apply_seccomp()?;
 
             if let Ok(envs) = read_to_string("/etc/rcr-env") {
                 for line in envs.lines() {
@@ -84,15 +84,18 @@ pub fn run_container(
 
             let args: Vec<CString> = command
                 .iter()
-                .map(|s| CString::new(s.as_str()).unwrap())
-                .collect();
+                .map(|s| CString::new(s.as_str()).context("cstring creation failed"))
+                .collect::<Result<Vec<_>>>()?;
 
-            execvp(&args[0], &args).expect("program execution failed");
+            execvp(&args[0], &args)
+                .with_context(|| format!("failed to execute '{}'", &command[0]))?;
         }
         ForkResult::Parent { child } => {
-            waitpid(child, None).expect("waitpid failed");
+            waitpid(child, None).context("waitpid failed")?;
         }
     }
+
+    Ok(())
 }
 
 fn setup_dns(layer: &str) {
@@ -108,19 +111,20 @@ fn setup_dns(layer: &str) {
     let _ = fs::write(&target, content);
 }
 
-fn setup_container_networking(name: &str, child_ip: &str) {
+fn setup_container_networking(name: &str, child_ip: &str) -> Result<()> {
     let (_, vchild) = get_vhost_vchild(name);
 
-    execute_command("ip", &["link", "set", "lo", "up"]);
+    execute_command("ip", &["link", "set", "lo", "up"])?;
     execute_command(
         "ip",
         &["addr", "add", &format!("{child_ip}/24"), "dev", &vchild],
-    );
-    execute_command("ip", &["link", "set", &vchild, "up"]);
-    execute_command("ip", &["route", "add", "default", "via", "10.0.0.1"]);
+    )?;
+    execute_command("ip", &["link", "set", &vchild, "up"])?;
+    execute_command("ip", &["route", "add", "default", "via", "10.0.0.1"])?;
+    Ok(())
 }
 
-fn pivot_root_util(merged: &str) {
+fn pivot_root_util(merged: &str) -> Result<()> {
     // pivot_root doesn't change a dir, it swaps mounts
     mount(
         Some(merged),
@@ -129,28 +133,29 @@ fn pivot_root_util(merged: &str) {
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     )
-    .expect("bind mount rootfs failed");
+    .context("bind mount rootfs failed")?;
 
     let put_old = format!("{merged}/.old_root");
-    fs::create_dir_all(&put_old).expect("create .old_root failed");
+    fs::create_dir_all(&put_old).context("create .old_root failed")?;
 
-    pivot_root(merged, put_old.as_str()).expect("pivot_root failed");
+    pivot_root(merged, put_old.as_str()).context("pivot_root failed")?;
 
-    chdir("/").expect("chdir failed");
+    chdir("/").context("chdir failed")?;
 
-    umount2("/.old_root", MntFlags::MNT_DETACH).expect("unmount old root failed");
+    umount2("/.old_root", MntFlags::MNT_DETACH).context("unmount old root failed")?;
     fs::remove_dir("/.old_root").ok();
+    Ok(())
 }
 
-fn setup_overlay(name: &str, lower: &str) -> String {
+fn setup_overlay(name: &str, lower: &str) -> Result<String> {
     let base = format!("/run/rcr/{name}");
     let upper = format!("{base}/upper");
     let work = format!("{base}/work");
     let merged = format!("{base}/merged");
 
-    fs::create_dir_all(&upper).expect("create upper failed");
-    fs::create_dir_all(&work).expect("create work failed");
-    fs::create_dir_all(&merged).expect("create merged failed");
+    fs::create_dir_all(&upper).context("create upper failed")?;
+    fs::create_dir_all(&work).context("create work failed")?;
+    fs::create_dir_all(&merged).context("create merged failed")?;
 
     let options = format!("lowerdir={lower},upperdir={upper},workdir={work}");
     mount(
@@ -160,9 +165,9 @@ fn setup_overlay(name: &str, lower: &str) -> String {
         MsFlags::empty(),
         Some(options.as_str()),
     )
-    .expect("overlay mount failed");
+    .context("overlay mount failed")?;
 
-    merged
+    Ok(merged)
 }
 
 fn drop_capabilities() {
@@ -184,18 +189,19 @@ fn drop_capabilities() {
     }
 }
 
-fn apply_seccomp() {
+fn apply_seccomp() -> Result<()> {
     let mut filter =
-        ScmpFilterContext::new(ScmpAction::Allow).expect("failed to create seccomp filter");
+        ScmpFilterContext::new(ScmpAction::Allow).context("failed to create seccomp filter")?;
 
     let blocked = ["reboot", "swapon", "swapoff", "mount", "umount2"];
 
     for name in blocked {
-        let sc = ScmpSyscall::from_name(name).expect("invalid syscall name");
+        let sc = ScmpSyscall::from_name(name).context("invalid syscall name")?;
         filter
             .add_rule(ScmpAction::Errno(libc::EPERM), sc)
-            .expect("add seccomp rule failed");
+            .context("add seccomp rule failed")?;
     }
 
-    filter.load().expect("failed to load filter");
+    filter.load().context("failed to load filter")?;
+    Ok(())
 }

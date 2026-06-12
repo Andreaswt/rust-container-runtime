@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
@@ -16,27 +17,29 @@ pub fn orchestrator(
     detach: bool,
     clean_on_stop: bool,
     command: Vec<String>,
-) {
+) -> Result<()> {
     if let Some(container) = load(name) {
         let container_is_alive = kill(Pid::from_raw(container.pid), None).is_ok();
         if container_is_alive {
             println!("Container {name} already exists.");
-            return;
+            return Ok(());
         }
         cleanup(name);
     }
     // child -> orchestrator: netns created
-    let (netns_ready_r, netns_ready_w) = pipe().expect("pipe netns_ready failed");
+    let (netns_ready_r, netns_ready_w) = pipe().context("pipe netns_ready failed")?;
     // orchestrator -> child: network configure, execute now
-    let (net_configured_r, net_configured_w) = pipe().expect("pipe net_configured failed");
+    let (net_configured_r, net_configured_w) = pipe().context("pipe net_configured failed")?;
 
     let allocated_child_ip = allocate_ip();
 
     let stdout: Stdio;
     let stderr: Stdio;
     if detach {
-        let log = File::create(format!("/run/rcr/{name}.log")).expect("failed to create log");
-        let log_err = log.try_clone().expect("failed to clone stdout to stderr");
+        let log = File::create(format!("/run/rcr/{name}.log")).context("failed to create log")?;
+        let log_err = log
+            .try_clone()
+            .context("failed to clone stdout to stderr")?;
         stdout = std::process::Stdio::from(log);
         stderr = std::process::Stdio::from(log_err);
     } else {
@@ -60,15 +63,15 @@ pub fn orchestrator(
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .expect("failed to spawn child");
+        .context("failed to spawn child")?;
 
     let child_pid = child.id() as i32;
 
-    setup_cgroups(&name, child_pid);
+    setup_cgroups(&name, child_pid)?;
 
     let mut buf = [0u8; 1];
-    read(&netns_ready_r, &mut buf).expect("wait netns_ready failed");
-    setup_host_networking(&name, child_pid);
+    read(&netns_ready_r, &mut buf).context("wait netns_ready failed")?;
+    setup_host_networking(&name, child_pid)?;
 
     let (vhost, _) = get_vhost_vchild(&name);
     save(&ContainerState {
@@ -76,20 +79,22 @@ pub fn orchestrator(
         pid: child_pid,
         ip: allocated_child_ip,
         vhost: vhost,
-    });
+    })?;
 
-    write(&net_configured_w, &[1u8]).expect("signal net_configured failed");
+    write(&net_configured_w, &[1u8]).context("signal net_configured failed")?;
 
     if detach {
         println!("Started {name} in detach mode.");
-        return;
+        return Ok(());
     }
 
-    child.wait().expect("wait for child container failed");
+    child.wait().context("wait for child container failed")?;
 
     if clean_on_stop {
         cleanup(name);
     }
+
+    Ok(())
 }
 
 pub fn list_containers() {
@@ -133,7 +138,7 @@ pub fn logs(name: &str) {
     }
 }
 
-fn setup_host_networking(name: &str, child_pid: i32) {
+fn setup_host_networking(name: &str, child_pid: i32) -> Result<()> {
     let (vhost, vchild) = get_vhost_vchild(name);
 
     execute_command(
@@ -141,13 +146,13 @@ fn setup_host_networking(name: &str, child_pid: i32) {
         &[
             "link", "add", &vhost, "type", "veth", "peer", "name", &vchild,
         ],
-    );
+    )?;
     execute_command(
         "ip",
         &["link", "set", &vchild, "netns", &child_pid.to_string()],
-    );
-    execute_command("ip", &["addr", "add", "10.0.0.1/24", "dev", &vhost]);
-    execute_command("ip", &["link", "set", &vhost, "up"]);
+    )?;
+    execute_command("ip", &["addr", "add", "10.0.0.1/24", "dev", &vhost])?;
+    execute_command("ip", &["link", "set", &vhost, "up"])?;
 
     // enable forwarding + NAT so the container reaches the internet
     let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
@@ -180,11 +185,12 @@ fn setup_host_networking(name: &str, child_pid: i32) {
                 "-j",
                 "MASQUERADE",
             ],
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn setup_cgroups(name: &str, child_pid: i32) {
+fn setup_cgroups(name: &str, child_pid: i32) -> Result<()> {
     let _ = fs::write(
         "/sys/fs/cgroup/cgroup.subtree_control",
         "+memory +cpu +pids",
@@ -197,12 +203,13 @@ fn setup_cgroups(name: &str, child_pid: i32) {
 
     let cgroup = format!("/sys/fs/cgroup/rcr/{name}");
 
-    fs::create_dir_all(&cgroup).expect("creating cgroup dir failed");
+    fs::create_dir_all(&cgroup).context("creating cgroup dir failed")?;
 
-    fs::write(format!("{cgroup}/memory.max"), "104857600").expect("setting memory.max failed");
-    fs::write(format!("{cgroup}/pids.max"), "20").expect("setting pids.max failed");
-    fs::write(format!("{cgroup}/cpu.max"), "20000 100000").expect("setting cpu.max failed");
+    fs::write(format!("{cgroup}/memory.max"), "104857600").context("setting memory.max failed")?;
+    fs::write(format!("{cgroup}/pids.max"), "20").context("setting pids.max failed")?;
+    fs::write(format!("{cgroup}/cpu.max"), "20000 100000").context("setting cpu.max failed")?;
 
     fs::write(format!("{cgroup}/cgroup.procs"), child_pid.to_string())
-        .expect("adding child to cgroup failed");
+        .context("adding child to cgroup failed")?;
+    Ok(())
 }

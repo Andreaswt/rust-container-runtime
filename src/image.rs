@@ -1,9 +1,11 @@
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use crate::host::orchestrator;
-use crate::utils::cleanup;
+use crate::utils::{cleanup, execute_command};
 
 const LAYERS_DIR: &str = "/var/lib/rcr/layers";
 
@@ -16,23 +18,44 @@ pub fn layer_id(parent_id: &str, cur_command: &str) -> String {
     hex::encode(digest)
 }
 
-pub fn commit(upper: &str, id: &str) {
+pub fn commit(upper: &str, id: &str) -> Result<()> {
     let dest = format!("{LAYERS_DIR}/{id}");
 
     // already cached
     if fs::metadata(&dest).is_ok() {
-        return;
+        return Ok(());
     }
 
-    fs::create_dir_all(LAYERS_DIR).expect("failed to create layers dir");
+    fs::create_dir_all(LAYERS_DIR).context("failed to create layers dir")?;
 
     let status = Command::new("cp")
         .args(["-a", upper, &dest])
         .status()
-        .expect("cp failed");
+        .context("cp failed")?;
     if !status.success() {
-        panic!("failed to copy upper into layer {id}")
+        bail!("failed to copy upper into layer {id}");
     }
+
+    Ok(())
+}
+
+pub fn pull_image(distro: &str) -> Result<()> {
+    let url = match distro {
+        "alpine" => {
+            "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+        }
+        "ubuntu" => {
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.4-base-arm64.tar.gz"
+        }
+        _ => bail!("unsupported distro: {distro}"),
+    };
+    let dest = format!("/var/lib/rcr/bases/{distro}");
+    fs::create_dir_all(&dest).context("create base dir failed")?;
+    execute_command(
+        "sh",
+        &["-c", &format!("curl -sL {url} | tar -xz -C {dest}")],
+    )?;
+    Ok(())
 }
 
 // Fluent api builder
@@ -72,10 +95,13 @@ impl Image {
         self
     }
 
-    pub fn build(self, image_name: &str) {
-        const ROOTFS: &str = "/home/andreastrolle.guest/rootfs";
+    pub fn build(self, image_name: &str) -> Result<()> {
+        let base_path = format!("/var/lib/rcr/bases/{}", self.base);
+        if !Path::new(&base_path).exists() {
+            pull_image(&self.base)?;
+        }
 
-        let mut lower = ROOTFS.to_string();
+        let mut lower = base_path;
         let mut parent_id = self.base.clone();
 
         for (i, step) in self.steps.iter().enumerate() {
@@ -92,25 +118,26 @@ impl Image {
                 match step {
                     Step::Run(command) => {
                         let build_name = format!("build-{image_name}-{i}");
-                        run_build_step(&build_name, &lower, command);
+                        run_build_step(&build_name, &lower, command)?;
 
                         let upper = format!("/run/rcr/{build_name}/upper");
-                        commit(&upper, &id);
+                        commit(&upper, &id)?;
                         cleanup(&build_name);
                     }
                     Step::Copy(from, to) => {
                         let container_dest = format!("{layer_path}/{}", to.trim_start_matches("/"));
                         if let Some(parent) = std::path::Path::new(&container_dest).parent() {
-                            fs::create_dir_all(parent).expect("create container dest dir failed");
+                            fs::create_dir_all(parent)
+                                .context("create container dest dir failed")?;
                         }
-                        fs::copy(from, container_dest).expect("Copy failed");
+                        fs::copy(from, container_dest).context("Copy failed")?;
                     }
                     Step::Env(key, val) => {
-                        fs::create_dir_all(&layer_path).expect("create env layer failed");
+                        fs::create_dir_all(&layer_path).context("create env layer failed")?;
                         let env_file = format!("{layer_path}/etc");
-                        fs::create_dir_all(&env_file).expect("create etc dir failed");
+                        fs::create_dir_all(&env_file).context("create etc dir failed")?;
                         fs::write(format!("{env_file}/rcr-env"), format!("{key}={val}\n"))
-                            .expect("write to env failed");
+                            .context("write to env failed")?;
                     }
                 }
             }
@@ -119,17 +146,20 @@ impl Image {
             parent_id = id;
         }
 
-        save_image(image_name, &lower);
+        save_image(image_name, &lower)?;
+
+        Ok(())
     }
 }
 
-fn run_build_step(name: &str, lower: &str, command: &str) {
+fn run_build_step(name: &str, lower: &str, command: &str) -> Result<()> {
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
-    orchestrator(name, lower, false, false, cmd);
+    orchestrator(name, lower, false, false, cmd)
 }
 
-fn save_image(image_name: &str, lower: &str) {
+fn save_image(image_name: &str, lower: &str) -> Result<()> {
     let dir = "/var/lib/rcr/images";
-    fs::create_dir_all(dir).expect("create images dir failed");
-    fs::write(format!("{dir}/{image_name}"), lower).expect("image save failed");
+    fs::create_dir_all(dir).context("create images dir failed")?;
+    fs::write(format!("{dir}/{image_name}"), lower).context("image save failed")?;
+    Ok(())
 }
