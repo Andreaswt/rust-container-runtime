@@ -15,8 +15,15 @@ pub enum Commands {
         name: String,
         #[arg(short, long)]
         detach: bool,
+        #[arg(short, long)]
+        image: Option<String>,
         #[arg(trailing_var_arg = true, default_values_t = vec!["/bin/sh".to_string()])]
         command: Vec<String>,
+    },
+    /// Builds a new image
+    Build {
+        /// Container name
+        name: String,
     },
     /// List running containers
     List,
@@ -35,6 +42,7 @@ pub enum Commands {
     SpawnChildContainer {
         name: String,
         child_ip: String,
+        lower: String,
         netns_ready_fd: i32,
         net_configured_fd: i32,
         #[arg(trailing_var_arg = true)]

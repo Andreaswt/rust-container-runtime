@@ -12,11 +12,10 @@ use nix::unistd::{ForkResult, chdir, execvp, fork, pivot_root, read, sethostname
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-const ROOTFS: &str = "/home/andreastrolle.guest/rootfs";
-
 pub fn run_container(
     name: &str,
     child_ip: &str,
+    lower: &str,
     netns_ready_w: i32,
     net_configured_r: i32,
     command: Vec<String>,
@@ -56,7 +55,9 @@ pub fn run_container(
             std::fs::write(format!("/sys/fs/cgroup/rcr/{name}/cgroup.procs"), "0")
                 .expect("self-join cgroup failed");
 
-            pivot_root_util();
+            let merged = setup_overlay(name, lower);
+            setup_dns(&merged);
+            pivot_root_util(&merged);
 
             mount(
                 Some("proc"),
@@ -83,6 +84,19 @@ pub fn run_container(
     }
 }
 
+fn setup_dns(layer: &str) {
+    let target = format!("{layer}/etc/resolv.conf");
+    let _ = fs::create_dir_all(format!("{layer}/etc"));
+
+    let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let content = if host.contains("127.0.0") {
+        "nameserver 1.1.1.1\n".to_string()
+    } else {
+        host
+    };
+    let _ = fs::write(&target, content);
+}
+
 fn setup_container_networking(name: &str, child_ip: &str) {
     let (_, vchild) = get_vhost_vchild(name);
 
@@ -95,26 +109,49 @@ fn setup_container_networking(name: &str, child_ip: &str) {
     execute_command("ip", &["route", "add", "default", "via", "10.0.0.1"]);
 }
 
-fn pivot_root_util() {
-    // pivot_root doesn't change a dir, it swaps mounts (/ <-> ROOTFS)
+fn pivot_root_util(merged: &str) {
+    // pivot_root doesn't change a dir, it swaps mounts
     mount(
-        Some(ROOTFS),
-        ROOTFS,
+        Some(merged),
+        merged,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     )
     .expect("bind mount rootfs failed");
 
-    let put_old = format!("{ROOTFS}/.old_root");
+    let put_old = format!("{merged}/.old_root");
     fs::create_dir_all(&put_old).expect("create .old_root failed");
 
-    pivot_root(ROOTFS, put_old.as_str()).expect("pivot_root failed");
+    pivot_root(merged, put_old.as_str()).expect("pivot_root failed");
 
     chdir("/").expect("chdir failed");
 
     umount2("/.old_root", MntFlags::MNT_DETACH).expect("unmount old root failed");
     fs::remove_dir("/.old_root").ok();
+}
+
+fn setup_overlay(name: &str, lower: &str) -> String {
+    let base = format!("/run/rcr/{name}");
+    let upper = format!("{base}/upper");
+    let work = format!("{base}/work");
+    let merged = format!("{base}/merged");
+
+    fs::create_dir_all(&upper).expect("create upper failed");
+    fs::create_dir_all(&work).expect("create work failed");
+    fs::create_dir_all(&merged).expect("create merged failed");
+
+    let options = format!("lowerdir={lower},upperdir={upper},workdir={work}");
+    mount(
+        Some("overlay"),
+        merged.as_str(),
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(options.as_str()),
+    )
+    .expect("overlay mount failed");
+
+    merged
 }
 
 fn drop_capabilities() {

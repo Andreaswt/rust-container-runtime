@@ -10,7 +10,21 @@ use nix::unistd::Pid;
 
 use nix::unistd::{pipe, read, write};
 
-pub fn orchestrator(name: &str, detach: bool, command: Vec<String>) {
+pub fn orchestrator(
+    name: &str,
+    lower: &str,
+    detach: bool,
+    clean_on_stop: bool,
+    command: Vec<String>,
+) {
+    if let Some(container) = load(name) {
+        let container_is_alive = kill(Pid::from_raw(container.pid), None).is_ok();
+        if container_is_alive {
+            println!("Container {name} already exists.");
+            return;
+        }
+        cleanup(name);
+    }
     // child -> orchestrator: netns created
     let (netns_ready_r, netns_ready_w) = pipe().expect("pipe netns_ready failed");
     // orchestrator -> child: network configure, execute now
@@ -34,6 +48,7 @@ pub fn orchestrator(name: &str, detach: bool, command: Vec<String>) {
     cmd.arg("spawn-child-container")
         .arg(name)
         .arg(&allocated_child_ip)
+        .arg(lower)
         .arg(netns_ready_w.as_raw_fd().to_string())
         .arg(net_configured_r.as_raw_fd().to_string());
 
@@ -71,7 +86,10 @@ pub fn orchestrator(name: &str, detach: bool, command: Vec<String>) {
     }
 
     child.wait().expect("wait for child container failed");
-    cleanup(name);
+
+    if clean_on_stop {
+        cleanup(name);
+    }
 }
 
 pub fn list_containers() {
