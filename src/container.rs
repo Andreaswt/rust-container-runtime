@@ -1,4 +1,5 @@
-use std::fs;
+use std::env::set_var;
+use std::fs::{self, read_to_string};
 
 use crate::utils::{execute_command, get_vhost_vchild};
 use caps::{CapSet, Capability};
@@ -70,6 +71,16 @@ pub fn run_container(
 
             drop_capabilities();
             apply_seccomp();
+
+            if let Ok(envs) = read_to_string("/etc/rcr-env") {
+                for line in envs.lines() {
+                    if let Some((key, value)) = line.split_once("=") {
+                        unsafe {
+                            set_var(key, value);
+                        }
+                    }
+                }
+            }
 
             let args: Vec<CString> = command
                 .iter()

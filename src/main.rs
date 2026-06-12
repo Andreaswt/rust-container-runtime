@@ -33,8 +33,13 @@ fn main() {
         Commands::Build { name } => {
             Image::base("alpine")
                 .run("apk add --no-cache python3")
-                .run("apk add bird")
-                .run("apk add dog")
+                .env("secret", "mysecret123")
+                .copy(
+                    "/Users/andreastrolle/Documents/Repositories/rust-container-runtime/main.py",
+                    "/main.py",
+                )
+                .run("printenv secret")
+                .run("python /main.py")
                 .build(&name);
         }
         Commands::List => list_containers(),

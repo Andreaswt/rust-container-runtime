@@ -38,7 +38,13 @@ pub fn commit(upper: &str, id: &str) {
 // Fluent api builder
 pub struct Image {
     base: String,
-    steps: Vec<String>,
+    steps: Vec<Step>,
+}
+
+enum Step {
+    Run(String),
+    Copy(String, String),
+    Env(String, String),
 }
 
 impl Image {
@@ -50,7 +56,19 @@ impl Image {
     }
 
     pub fn run(mut self, command: &str) -> Self {
-        self.steps.push(command.to_string());
+        self.steps.push(Step::Run(command.to_string()));
+        self
+    }
+
+    pub fn copy(mut self, from: &str, to: &str) -> Self {
+        self.steps
+            .push(Step::Copy(from.to_string(), to.to_string()));
+        self
+    }
+
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.steps
+            .push(Step::Env(key.to_string(), value.to_string()));
         self
     }
 
@@ -61,16 +79,40 @@ impl Image {
         let mut parent_id = self.base.clone();
 
         for (i, step) in self.steps.iter().enumerate() {
-            let id = layer_id(&parent_id, step);
+            let step_hash_key = match step {
+                Step::Run(str) => format!("run:{str}"),
+                Step::Copy(from, to) => format!("copy:{from}:{to}"),
+                Step::Env(key, val) => format!("env:{key}:{val}"),
+            };
+
+            let id = layer_id(&parent_id, &step_hash_key);
 
             let layer_path = format!("{LAYERS_DIR}/{id}");
             if fs::metadata(&layer_path).is_err() {
-                let build_name = format!("build-{image_name}-{i}");
-                run_build_step(&build_name, &lower, step);
+                match step {
+                    Step::Run(command) => {
+                        let build_name = format!("build-{image_name}-{i}");
+                        run_build_step(&build_name, &lower, command);
 
-                let upper = format!("/run/rcr/{build_name}/upper");
-                commit(&upper, &id);
-                cleanup(&build_name);
+                        let upper = format!("/run/rcr/{build_name}/upper");
+                        commit(&upper, &id);
+                        cleanup(&build_name);
+                    }
+                    Step::Copy(from, to) => {
+                        let container_dest = format!("{layer_path}/{}", to.trim_start_matches("/"));
+                        if let Some(parent) = std::path::Path::new(&container_dest).parent() {
+                            fs::create_dir_all(parent).expect("create container dest dir failed");
+                        }
+                        fs::copy(from, container_dest).expect("Copy failed");
+                    }
+                    Step::Env(key, val) => {
+                        fs::create_dir_all(&layer_path).expect("create env layer failed");
+                        let env_file = format!("{layer_path}/etc");
+                        fs::create_dir_all(&env_file).expect("create etc dir failed");
+                        fs::write(format!("{env_file}/rcr-env"), format!("{key}={val}\n"))
+                            .expect("write to env failed");
+                    }
+                }
             }
 
             lower = format!("{layer_path}:{lower}");
